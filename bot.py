@@ -21,12 +21,12 @@ import asyncio
 
 import os
 
-TOKEN = os.getenv("BOT_TOKEN")  # теперь токен берётся из окружения
-
+TOKEN = os.getenv("BOT_TOKEN")  # берём токен из переменной окружения
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # для канала
 
 CATALOG_PATH = "catalog.xlsx"
 # Куда постить (можно @username_канала или chat_id вида -100...)
-CHANNEL_ID = "@Ikea2Home"
+# CHANNEL_ID = "@Ikea2Home"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
