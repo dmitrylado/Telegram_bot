@@ -1,0 +1,5 @@
+aiogram
+requests
+pandas
+beautifulsoup4
+openpyxl
