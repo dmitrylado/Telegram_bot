@@ -1,11 +1,11 @@
-import os
 import re
 import time
 import requests
 import pandas as pd
 from bs4 import BeautifulSoup
-import asyncio
 import logging
+import asyncio
+import os
 
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import Command
@@ -16,241 +16,211 @@ TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 
 CATALOG_PATH = "catalog.xlsx"
+PAGE_SIZE = 10
+
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
-CACHE = {}
-CACHE_TTL = 60 * 30  # 30 минут
-PAGE_SIZE = 10
+# --- СЕССИИ (ВАЖНО) ---
+SESSION = {}  
+# {
+#   chat_id: {
+#       "mode": "excel" | "ikea",
+#       "items": [...],
+#       "page": 0
+#   }
+# }
 
-# --- Состояния ---
-WAITING_ORDER_QUERY = set()  # chat.id ожидает поиска на IKEA
-
-# --- Функции для Excel ---
-def load_catalog():
-    return pd.read_excel(CATALOG_PATH)
-
+# ---------------- UTIL ----------------
 def safe_int(x):
     try:
         return int(x)
-    except Exception:
+    except:
         return 0
 
-def format_rub_price(value) -> str:
-    if value is None:
-        return ""
-    s = str(value).strip()
-    if s == "" or s.lower() == "nan":
-        return ""
-    s = s.replace(" ", "").replace(",", ".")
+def load_catalog():
+    return pd.read_excel(CATALOG_PATH)
+
+def format_price(v):
     try:
-        num = float(s)
-        rub = int(round(num))
-        return f"{rub} руб."
-    except Exception:
-        return f"{s} руб."
+        return f"{int(round(float(str(v).replace(',', '.'))))} руб."
+    except:
+        return str(v)
 
-def format_caption_from_excel(item: dict) -> str:
-    title = item.get("title", "(без названия)")
-    desc = item.get("description", "")
-    link = item.get("link", "")
-    parts = [f"<b>{title}</b>"]
-    if desc:
-        parts.append(f"<i>{desc}</i>")
-    price_str = format_rub_price(item.get("price"))
-    if price_str:
-        parts.append(f"<b>Цена:</b> {price_str}")
-    if link:
-        parts.append(f'<a href="{link}">Купить на Авито</a>')
-    return "\n".join(parts)
-
-def build_category_keyboard(df_available: pd.DataFrame) -> types.InlineKeyboardMarkup:
-    CATEGORY_MAP = {}
-    if "category_1" not in df_available.columns:
-        return types.InlineKeyboardMarkup(inline_keyboard=[
-            [types.InlineKeyboardButton(text="📦 Все категории", callback_data="cat:ALL")]
-        ])
-    categories = df_available["category_1"].astype(str).map(lambda x: x.strip())
-    categories = [c for c in categories.unique().tolist() if c and c.lower() != "nan"]
-    categories.sort()
-    keyboard: list[list[types.InlineKeyboardButton]] = []
-    keyboard.append([types.InlineKeyboardButton(text="📦 Все категории", callback_data="cat:ALL")])
-    row: list[types.InlineKeyboardButton] = []
-    for i, cat in enumerate(categories, start=1):
-        cat_id = str(i)
-        CATEGORY_MAP[cat_id] = cat
-        row.append(types.InlineKeyboardButton(text=cat, callback_data=f"cat:{cat_id}"))
-        if len(row) == 2:
-            keyboard.append(row)
-            row = []
-    if row:
-        keyboard.append(row)
-    keyboard.append([types.InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:start")])
-    return types.InlineKeyboardMarkup(inline_keyboard=keyboard)
-
-# --- Функции для IKEA ---
-CACHE_IKEA = {}
-
-def normalize(s: str) -> str:
-    return re.sub(r"\s+", " ", str(s).strip().lower())
-
+# ---------------- IKEA PARSER ----------------
 def fetch_ikea(query: str):
-    """Парсим IKEA LT русскую версию, ищем товары по названию или категории."""
-    base_url = "https://www.ikea.com/lt/ru/search/?q="
-    url = base_url + requests.utils.quote(query)
-    now = time.time()
-    if url in CACHE_IKEA and (now - CACHE_IKEA[url][0]) < CACHE_TTL:
-        return CACHE_IKEA[url][1]
-    r = requests.get(url, headers={"User-Agent": "Mozilla/5.0"}, timeout=10)
-    r.raise_for_status()
-    soup = BeautifulSoup(r.text, "html.parser")
-    items = []
-    # Ищем товары по классу (основной блок на странице)
-    product_cards = soup.select(".plp-fragment__products li")  # актуальный селектор может меняться
-    for card in product_cards:
-        title_el = card.select_one(".product-compact__name, .product-compact__title")
-        price_el = card.select_one(".product-compact__price")
-        link_el = card.select_one("a")
-        photo_el = card.select_one("img")
-        if not title_el:
-            continue
-        item = {
-            "title": title_el.get_text(strip=True),
-            "price": price_el.get_text(strip=True) if price_el else None,
-            "url": "https://www.ikea.com" + link_el["href"] if link_el else None,
-            "photo": photo_el["src"] if photo_el else None,
-        }
-        items.append(item)
-        if len(items) >= 50:  # максимум 50 результатов
-            break
-    CACHE_IKEA[url] = (now, items)
-    return items
+    url = f"https://www.ikea.com/lt/ru/search/?q={query.replace(' ', '%20')}"
+    headers = {"User-Agent": "Mozilla/5.0"}
 
-# --- Постраничная отправка ---
-async def send_category_page(message: types.Message, code="ALL", page=0, items=None):
-    if items is None:
-        # Excel доступность
-        df = load_catalog()
-        df["__stock_int"] = df["stock"].apply(safe_int)
-        available = df[df["__stock_int"] > 0].copy()
-        if available.empty:
-            await message.answer("Сейчас нет доступных позиций 😔")
-            return
-        total_items = available.to_dict("records")
-    else:
-        total_items = items
+    try:
+        r = requests.get(url, headers=headers, timeout=10)
+        soup = BeautifulSoup(r.text, "html.parser")
 
-    total = len(total_items)
-    if total == 0:
-        await message.answer("Ничего не найдено 😔")
+        items = []
+
+        # IKEA часто меняет классы — используем максимально мягкий парсинг
+        for card in soup.select("div"):
+            title = card.get_text(" ", strip=True)
+
+            img = card.find("img")
+            if not img:
+                continue
+
+            src = img.get("src")
+
+            if title and len(title) < 120:
+                items.append({
+                    "title": title,
+                    "photo": src,
+                    "price": ""
+                })
+
+        return items[:50]
+
+    except Exception as e:
+        print("IKEA ERROR:", e)
+        return []
+
+# ---------------- PAGINATION ----------------
+async def send_page(chat_id: int, message: types.Message):
+    data = SESSION.get(chat_id)
+    if not data:
         return
+
+    items = data["items"]
+    page = data["page"]
 
     start = page * PAGE_SIZE
     end = start + PAGE_SIZE
-    page_items = total_items[start:end]
+    chunk = items[start:end]
 
-    await message.answer(f"Страница {page+1}/{(total + PAGE_SIZE - 1)//PAGE_SIZE}")
+    if not chunk:
+        await message.answer("Больше товаров нет.")
+        return
 
-    for item in page_items:
-        caption = f"<b>{item.get('title','')}</b>\n"
-        if item.get("price"):
-            caption += f"Цена: {item['price']}\n"
-        if item.get("url"):
-            caption += f'<a href="{item["url"]}">Ссылка</a>'
-        if item.get("photo"):
-            try:
-                await message.answer_photo(item["photo"], caption=caption, parse_mode="HTML")
-            except:
-                await message.answer(caption, parse_mode="HTML")
+    total_pages = (len(items) + PAGE_SIZE - 1) // PAGE_SIZE
+
+    await message.answer(f"Страница {page+1}/{total_pages}")
+
+    for it in chunk:
+        text = ""
+
+        if data["mode"] == "excel":
+            text = (
+                f"<b>{it.get('title')}</b>\n"
+                f"Цена: {format_price(it.get('price'))}\n"
+                f"Наличие: {it.get('stock')}"
+            )
         else:
-            await message.answer(caption, parse_mode="HTML")
+            text = f"<b>{it.get('title')}</b>"
 
-    # Навигация
-    nav_buttons = []
+        if it.get("photo"):
+            try:
+                await message.answer_photo(it["photo"], caption=text, parse_mode="HTML")
+            except:
+                await message.answer(text, parse_mode="HTML")
+        else:
+            await message.answer(text, parse_mode="HTML")
+
+    kb = []
+
     if page > 0:
-        nav_buttons.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"page:{page-1}"))
-    if end < total:
-        nav_buttons.append(types.InlineKeyboardButton("Далее ➡️", callback_data=f"page:{page+1}"))
-    if nav_buttons:
-        kb = types.InlineKeyboardMarkup(inline_keyboard=[nav_buttons])
-        await message.answer("Навигация:", reply_markup=kb)
+        kb.append(types.InlineKeyboardButton("⬅️ Назад", callback_data="page:prev"))
+    if end < len(items):
+        kb.append(types.InlineKeyboardButton("➡️ Далее", callback_data="page:next"))
 
-# --- Клавиатуры ---
-main_kb = types.ReplyKeyboardMarkup(
-    keyboard=[
-        [types.KeyboardButton("Текущая доступность")],
-        [types.KeyboardButton("Под заказ"), types.KeyboardButton("Найти")],
-    ], resize_keyboard=True
-)
+    if kb:
+        await message.answer(
+            "Навигация",
+            reply_markup=types.InlineKeyboardMarkup(inline_keyboard=[kb])
+        )
 
-start_inline_kb = types.InlineKeyboardMarkup(inline_keyboard=[
-    [types.InlineKeyboardButton("✅ Текущая доступность", callback_data="menu:available")],
-    [types.InlineKeyboardButton("🕒 Под заказ", callback_data="menu:order")],
-    [types.InlineKeyboardButton("🔎 Найти", callback_data="menu:search")],
-])
-
-# --- Обработчики ---
+# ---------------- COMMANDS ----------------
 @dp.message(Command("start"))
-async def cmd_start(message: types.Message):
-    await message.answer("Привет! Выберите действие:", reply_markup=start_inline_kb)
+async def start(m: types.Message):
+    await m.answer(
+        "Меню:",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[
+                [types.KeyboardButton(text="Текущая доступность")],
+                [types.KeyboardButton(text="Под заказ")],
+                [types.KeyboardButton(text="Найти")]
+            ],
+            resize_keyboard=True
+        )
+    )
 
+# ---------------- EXCEL MODE ----------------
 @dp.message(F.text == "Текущая доступность")
-async def cmd_available(message: types.Message):
+async def available(m: types.Message):
     df = load_catalog()
-    df["__stock_int"] = df["stock"].apply(safe_int)
-    available = df[df["__stock_int"] > 0].copy()
-    if available.empty:
-        await message.answer("Сейчас нет доступных позиций 😔", reply_markup=main_kb)
-        return
-    items = available.to_dict("records")
-    await send_category_page(message, items=items)
+    df["stock"] = df["stock"].apply(safe_int)
+    df = df[df["stock"] > 0]
 
+    items = df.to_dict("records")
+
+    SESSION[m.chat.id] = {
+        "mode": "excel",
+        "items": items,
+        "page": 0
+    }
+
+    await send_page(m.chat.id, m)
+
+# ---------------- IKEA MODE ----------------
 @dp.message(F.text == "Под заказ")
-async def cmd_under_order(message: types.Message):
-    WAITING_ORDER_QUERY.add(message.chat.id)
-    await message.answer("Введите поисковый запрос для IKEA (название или категория):")
+async def order(m: types.Message):
+    await m.answer("Введите запрос для IKEA (например: простыня, лампа, chair):")
+    SESSION[m.chat.id] = {"mode": "wait_ikea"}
 
-@dp.message(F.text == "Найти")
-async def cmd_search_stub(message: types.Message):
-    await message.answer("Раздел «Найти» пока в разработке 🙂", reply_markup=main_kb)
+@dp.message()
+async def text_handler(m: types.Message):
+    chat_id = m.chat.id
+    session = SESSION.get(chat_id)
 
-@dp.message(F.text)
-async def handle_text(message: types.Message):
-    if message.chat.id in WAITING_ORDER_QUERY:
-        WAITING_ORDER_QUERY.remove(message.chat.id)
-        query = message.text.strip()
-        await message.answer(f"Ищу на IKEA: {query}…")
-        results = fetch_ikea(query)
-        if not results:
-            await message.answer("Ничего не найдено на IKEA 😔")
-            return
-        await send_category_page(message, items=results)
+    if not session:
         return
 
-# --- Inline навигация ---
-@dp.callback_query(lambda c: c.data and c.data.startswith("page:"))
-async def callback_page(call: types.CallbackQuery):
-    try:
-        page = int(call.data.split(":")[1])
-        await call.answer()
-        # Для упрощения, можно сохранять last search в глобальную переменную, но для demo оставим Excel
-        await send_category_page(call.message, page=page)
-    except Exception as e:
-        await call.answer("Ошибка навигации", show_alert=True)
+    # ожидание IKEA запроса
+    if session.get("mode") == "wait_ikea":
+        query = m.text
 
-# --- Меню ---
-@dp.callback_query(lambda c: c.data and c.data.startswith("menu:"))
-async def menu_callback(call: types.CallbackQuery):
-    action = call.data.split(":")[1]
-    if action == "available":
-        await cmd_available(call.message)
-    elif action == "order":
-        await cmd_under_order(call.message)
-    elif action == "search":
-        await cmd_search_stub(call.message)
-    await call.answer()
+        await m.answer(f"Ищу IKEA: {query} ...")
 
-# --- Запуск ---
+        items = fetch_ikea(query)
+
+        if not items:
+            await m.answer("Ничего не найдено 😔")
+            SESSION.pop(chat_id, None)
+            return
+
+        SESSION[chat_id] = {
+            "mode": "ikea",
+            "items": items,
+            "page": 0
+        }
+
+        await send_page(chat_id, m)
+
+# ---------------- NAVIGATION ----------------
+@dp.callback_query(F.data.startswith("page:"))
+async def nav(c: types.CallbackQuery):
+    chat_id = c.message.chat.id
+    session = SESSION.get(chat_id)
+
+    if not session:
+        await c.answer()
+        return
+
+    if c.data == "page:next":
+        session["page"] += 1
+    elif c.data == "page:prev":
+        session["page"] -= 1
+
+    await c.answer()
+    await send_page(chat_id, c.message)
+
+# ---------------- RUN ----------------
 async def main():
     await dp.start_polling(bot)
 
