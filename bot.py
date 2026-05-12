@@ -3,188 +3,196 @@ import time
 import requests
 from bs4 import BeautifulSoup
 from aiogram import Bot, Dispatcher, types, F
-from aiogram.filters import Command, Text
+from aiogram.filters import Command
 import asyncio
 import logging
 import os
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.getenv("BOT_TOKEN")
-CHANNEL_ID = os.getenv("CHANNEL_ID")
+TOKEN = os.getenv("BOT_TOKEN")  # токен бота
+CHANNEL_ID = os.getenv("CHANNEL_ID")  # для публикации, например "@channelusername"
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher()
 
 CACHE = {}
-CACHE_TTL = 60 * 30  # 30 минут
+CACHE_TTL = 60 * 30  # 30 минут кэш
 PAGE_SIZE = 10
 
-# --- Главное меню ---
-main_kb = types.ReplyKeyboardMarkup(
-    keyboard=[
-        [types.KeyboardButton(text="Текущая доступность")],
-        [types.KeyboardButton(text="Под заказ"), types.KeyboardButton(text="Найти")],
-    ],
-    resize_keyboard=True
-)
+# FSM для поиска
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
 
-# --- Inline стартовое меню ---
-start_inline_kb = types.InlineKeyboardMarkup(inline_keyboard=[
-    [types.InlineKeyboardButton(text="✅ Текущая доступность", callback_data="menu:available")],
-    [types.InlineKeyboardButton(text="🕒 Под заказ", callback_data="menu:order")],
-    [types.InlineKeyboardButton(text="🔎 Найти", callback_data="menu:search")],
-])
+class SearchStates(StatesGroup):
+    waiting_for_query = State()
 
-# --- Кеширование результатов поиска ---
-SEARCH_CACHE = {}  # query -> list of items
 
 def normalize(s: str) -> str:
     return re.sub(r"\s+", " ", str(s).strip().lower())
 
-def fetch_ikea_search(query: str):
+
+def parse_ikea_search(query: str):
     """
-    Возвращает список товаров с IKEA по запросу.
-    Каждый элемент: {"title": ..., "price": ..., "photo": ...}
+    Парсим IKEA (название, цену, фото) по поисковому запросу.
+    Возвращает список dict {'title', 'price', 'photo'}
     """
-    base_url = f"https://www.ikea.com/lt/ru/search/?q={query}"
-    headers = {"User-Agent": "Mozilla/5.0"}
+    url = f"https://www.ikea.com/lt/ru/search/?q={query}"
     now = time.time()
-    if query in CACHE and (now - CACHE[query][0]) < CACHE_TTL:
-        return CACHE[query][1]
+    if url in CACHE and (now - CACHE[url][0]) < CACHE_TTL:
+        return CACHE[url][1]
 
-    try:
-        r = requests.get(base_url, headers=headers, timeout=10)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        products = []
-
-        # Парсим карточки товаров
-        cards = soup.select("div[data-testid='product-card'], .product-compact")
-        for c in cards:
-            title_el = c.select_one(".product-compact__name, [data-testid='product-card__title']")
-            price_el = c.select_one(".product-compact__price, [data-testid='product-price']")
-            photo_el = c.select_one("img.product-compact__image, img[data-testid='product-card__image']")
-
-            if title_el:
-                title = title_el.get_text(strip=True)
-            else:
-                continue  # пропускаем если нет названия
-
-            price = price_el.get_text(strip=True) if price_el else "—"
-            photo = photo_el["src"] if photo_el and photo_el.has_attr("src") else None
-
-            products.append({"title": title, "price": price, "photo": photo})
-
-        CACHE[query] = (now, products)
-        return products
-    except Exception as e:
-        logging.error(f"Ошибка парсинга IKEA: {e}")
+    headers = {"User-Agent": "Mozilla/5.0"}
+    r = requests.get(url, headers=headers, timeout=10)
+    if r.status_code != 200:
         return []
 
-def build_nav_keyboard(query: str, page: int, total_items: int) -> types.InlineKeyboardMarkup:
-    nav_rows = []
-    if page > 0:
-        nav_rows.append(types.InlineKeyboardButton(text="⬅️ Назад", callback_data=f"orderpage:{query}:{page-1}"))
-    nav_rows.append(types.InlineKeyboardButton(text="⬅️ В меню", callback_data="menu:start"))
-    if (page+1)*PAGE_SIZE < total_items:
-        nav_rows.append(types.InlineKeyboardButton(text="Далее ➡️", callback_data=f"orderpage:{query}:{page+1}"))
-    return types.InlineKeyboardMarkup(inline_keyboard=[nav_rows])
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
 
-async def send_order_page(message: types.Message, query: str, page: int):
-    results = fetch_ikea_search(query)
-    if not results:
-        await message.answer("По вашему запросу ничего не найдено 😔", reply_markup=main_kb)
-        return
+    # Основные карточки товаров на IKEA
+    for item in soup.select("div[data-testid='product-card']"):
+        title_el = item.select_one("span[data-testid='product-card__name']")
+        price_el = item.select_one("span[data-testid='product-price__integer']")  # цена без валюты
+        photo_el = item.select_one("img[data-testid='product-card__image']")
 
-    total = len(results)
-    start = page * PAGE_SIZE
-    end = start + PAGE_SIZE
-    page_items = results[start:end]
-
-    await message.answer(
-        f"Результаты поиска: {query}\nСтраница {page+1}/{(total+PAGE_SIZE-1)//PAGE_SIZE} "
-        f"(позиции {start+1}-{min(end,total)} из {total})",
-        reply_markup=main_kb
-    )
-
-    for item in page_items:
-        caption = f"<b>{item['title']}</b>\nЦена: {item['price']}"
-        if item["photo"]:
-            try:
-                await message.answer_photo(photo=item["photo"], caption=caption, parse_mode="HTML")
-            except Exception:
-                await message.answer(caption, parse_mode="HTML")
+        if title_el:
+            title = title_el.get_text(strip=True)
         else:
-            await message.answer(caption, parse_mode="HTML")
+            title = "Без названия"
 
-    kb = build_nav_keyboard(query, page, total)
-    if kb.inline_keyboard:
-        await message.answer("Навигация:", reply_markup=kb)
+        if price_el:
+            price = price_el.get_text(strip=True) + " руб."
+        else:
+            price = "—"
 
-# --- Команды / кнопки ---
+        if photo_el and photo_el.has_attr("src"):
+            photo = photo_el["src"]
+        else:
+            photo = None
+
+        results.append({
+            "title": title,
+            "price": price,
+            "photo": photo
+        })
+
+    CACHE[url] = (now, results)
+    return results
+
+
+def build_nav_keyboard(page: int, total_pages: int) -> types.InlineKeyboardMarkup:
+    kb = []
+    row = []
+    if page > 0:
+        row.append(types.InlineKeyboardButton("⬅️ Назад", callback_data=f"searchpage:{page-1}"))
+    row.append(types.InlineKeyboardButton("🏠 В меню", callback_data="menu:start"))
+    if page < total_pages - 1:
+        row.append(types.InlineKeyboardButton("Далее ➡️", callback_data=f"searchpage:{page+1}"))
+    kb.append(row)
+    return types.InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+# --- Главное меню ---
+main_kb = types.ReplyKeyboardMarkup(
+    keyboard=[
+        [types.KeyboardButton("Текущая доступность")],
+        [types.KeyboardButton("Под заказ"), types.KeyboardButton("Найти")],
+    ],
+    resize_keyboard=True
+)
+
+start_inline_kb = types.InlineKeyboardMarkup(inline_keyboard=[
+    [types.InlineKeyboardButton("✅ Текущая доступность", callback_data="menu:available")],
+    [types.InlineKeyboardButton("🕒 Под заказ", callback_data="menu:order")],
+    [types.InlineKeyboardButton("🔎 Найти", callback_data="menu:search")],
+])
+
+
+# --- Обработчики ---
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
     await message.answer("Привет! Выберите действие:", reply_markup=start_inline_kb)
 
+
 @dp.message(F.text == "Под заказ")
-async def cmd_under_order(message: types.Message):
-    await message.answer("Введите поисковый запрос для IKEA:", reply_markup=types.ReplyKeyboardRemove())
-    # Ждем следующий ввод от пользователя
-    await OrderSearch.waiting_for_query.set()
+async def cmd_order(message: types.Message, state: FSMContext):
+    await message.answer("Введите поисковый запрос для товаров IKEA:", reply_markup=types.ReplyKeyboardRemove())
+    await state.set_state(SearchStates.waiting_for_query)
 
-@dp.message(F.text == "Найти")
-async def cmd_search_stub(message: types.Message):
-    await message.answer("Раздел «Найти» пока в разработке 🙂", reply_markup=main_kb)
 
-# --- FSM для ввода поискового запроса ---
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-
-class OrderSearch(StatesGroup):
-    waiting_for_query = State()
-
-@dp.message(OrderSearch.waiting_for_query)
-async def process_order_query(message: types.Message, state: FSMContext):
+@dp.message(SearchStates.waiting_for_query)
+async def process_search(message: types.Message, state: FSMContext):
     query = message.text.strip()
     if not query:
-        await message.answer("Введите корректный запрос")
+        await message.answer("Пустой запрос. Попробуйте ещё раз.")
         return
 
-    # Сохраняем результаты в кеш для навигации
-    SEARCH_CACHE[query] = fetch_ikea_search(query)
-
-    await send_order_page(message, query, page=0)
-    await state.clear()
-
-# --- Callback пагинации ---
-@dp.callback_query(lambda c: c.data and c.data.startswith("orderpage:"))
-async def order_page_callback(call: types.CallbackQuery):
-    try:
-        _, query, page_str = call.data.split(":", 2)
-        page = int(page_str)
-    except Exception:
-        await call.answer("Ошибка навигации", show_alert=True)
+    await state.update_data(query=query)
+    results = parse_ikea_search(query)
+    if not results:
+        await message.answer("По вашему запросу ничего не найдено 😔", reply_markup=main_kb)
+        await state.clear()
         return
 
+    # Сохраняем результаты в состоянии для постраничной навигации
+    await state.update_data(results=results, page=0)
+
+    # Показываем первую страницу
+    await send_search_page(message, state, page=0)
+
+
+async def send_search_page(message_or_call, state: FSMContext, page: int):
+    data = await state.get_data()
+    results = data.get("results", [])
+    total = len(results)
+    total_pages = (total + PAGE_SIZE - 1) // PAGE_SIZE
+    start_idx = page * PAGE_SIZE
+    end_idx = start_idx + PAGE_SIZE
+    page_items = results[start_idx:end_idx]
+
+    if not page_items:
+        await message_or_call.answer("Больше товаров нет ✅", reply_markup=main_kb)
+        await state.clear()
+        return
+
+    for item in page_items:
+        caption = f"**{item['title']}**\nЦена: {item['price']}"
+        if item['photo']:
+            await message_or_call.answer_photo(item['photo'], caption=caption, parse_mode="Markdown")
+        else:
+            await message_or_call.answer(caption, parse_mode="Markdown")
+
+    kb = build_nav_keyboard(page, total_pages)
+    await message_or_call.answer("Навигация:", reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data.startswith("searchpage:"))
+async def search_page_callback(call: types.CallbackQuery, state: FSMContext):
+    page = int(call.data.split(":")[1])
     await call.answer()
-    # Статического message передаем как объект call.message
-    await send_order_page(call.message, query, page)
+    await send_search_page(call.message, state, page)
 
-# --- Callback меню ---
-@dp.callback_query(lambda c: c.data and c.data.startswith("menu:"))
-async def menu_callback(call: types.CallbackQuery):
-    action = call.data.split(":",1)[1]
+
+@dp.callback_query(lambda c: c.data.startswith("menu:"))
+async def menu_callback(call: types.CallbackQuery, state: FSMContext):
+    action = call.data.split(":", 1)[1]
+    await call.answer()
     if action == "start":
-        await call.message.answer("Привет! Выберите действие:", reply_markup=start_inline_kb)
+        await call.message.answer("Выберите действие:", reply_markup=start_inline_kb)
     elif action == "order":
-        await call.message.answer("Введите поисковый запрос для IKEA:", reply_markup=types.ReplyKeyboardRemove())
-        await OrderSearch.waiting_for_query.set()
-    elif action == "search":
-        await call.message.answer("Раздел «Найти» пока в разработке 🙂", reply_markup=main_kb)
+        await call.message.answer("Введите поисковый запрос для товаров IKEA:", reply_markup=types.ReplyKeyboardRemove())
+        await state.set_state(SearchStates.waiting_for_query)
     elif action == "available":
-        await call.message.answer("Раздел текущей доступности пока не изменён", reply_markup=main_kb)
-    await call.answer()
+        await call.message.answer("Раздел «Текущая доступность» пока заглушка 🙂", reply_markup=main_kb)
+    elif action == "search":
+        await call.message.answer("Раздел «Найти» пока заглушка 🙂", reply_markup=main_kb)
+
+
+@dp.message(F.text == "Найти")
+async def cmd_find_stub(message: types.Message):
+    await message.answer("Раздел «Найти» пока в разработке 🙂", reply_markup=main_kb)
+
 
 async def main():
     await dp.start_polling(bot)
